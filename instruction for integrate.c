@@ -1,4 +1,10 @@
-
+/*
+CubeMX / middleware choice
+USB_DEVICE → CUSTOM_HID
+	Why keep it: STM32CubeMX does not generate a generic Vendor class.
+	Effect: CustomHID is used only as a carrier to keep USB middleware generated.
+	Important: We do not use HID functionality at runtime.
+*/
 /*
 There are the next steps to create custom  "vendor" class with CubeMX
 0)Create a project, enable midddleware, choose "Custom HID class"
@@ -16,6 +22,17 @@ USB_DEVICE/
 
 1)Create a project: FS device, endpoint size = 64bytes.
 2)Convert HID to Vendor Bulk:
+Interface and endpoint descriptors
+	File:
+	Class/CustomHID/Src/usbd_customhid.c
+	Object:
+	USBD_CUSTOM_HID_CfgDesc[]
+	Change bInterfaceClass to 0xFF:
+The host must see the interface as Vendor Specific, otherwise Windows loads HID driver.
+Change endpoint type to BULK (0x02):
+	Interrupt endpoints are inappropriate for raw data and limit throughput.
+	Keep HID descriptor block unchanged:
+	HAL expects it to exist; host ignores it because interface class ≠ HID.
   a)Open "../USB_DEVICE/usbd_desc.c" file (for old middleware),
     or for more modern middleware:
     Middlewares/ST/STM32_USB_Device_Library/Class/CustomHID/
@@ -109,6 +126,15 @@ HID_REPORT_DESC_SIZE, 0x00,
 | MaxPacket      | 64            |
 ---------------------------------------------------------------*/
  /*STEP 3 — Convert endpoint behavior from HID → BULK*/
+/*	Endpoint opening (runtime behavior)
+Function:
+USBD_CustomHID_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
+Change USBD_LL_OpenEP(..., USBD_EP_TYPE_INTR, ...) → BULK:
+	Descriptor type and runtime endpoint type must match.
+	Keep USBD_LL_PrepareReceive(...):
+	This arms the OUT endpoint; without it, no data will ever be received.
+Why not remove function:
+	HAL USB core requires this init hook for class activation.*/
    /*Open the next file: Middlewares/ST/STM32_USB_Device_Library/Class/CustomHID/Src/usbd_customhid.c
    Fine here the next function and change Endpoint type:
  */  
@@ -148,6 +174,19 @@ USBD_LL_PrepareReceive(pdev,
                        CUSTOM_HID_EPOUT_SIZE);
 /*--------------------------------------------------------------------------------
   STEP 4 — Disable HID control logic (EP0)
+  HID control path neutralization (EP0)
+
+Functions:
+	USBD_CustomHID_Setup(...)
+	USBD_CUSTOM_HID_EP0_RxReady(...)
+
+	Remove all HID request handling logic:
+GET_REPORT / SET_REPORT are invalid for Vendor Bulk.
+
+Keep functions, empty bodies (return USBD_OK):
+HAL expects these callbacks to exist and be callable.
+
+Why:  Prevents EP0 stalls and Windows enumeration issues.
   Make the device behave as pure Vendor Bulk
   Open it: Middlewares/ST/STM32_USB_Device_Library/Class/CustomHID/Src/usbd_customhid.c
  Find this function, and remove logic:
@@ -203,6 +242,22 @@ USB host ignores it because interface ≠ HID
 5)Rx callback (OUT)
 It is in the  usbd_customhid.c
 
+BULK OUT data reception
+
+Function:
+USBD_CUSTOM_HID_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
+
+Keep function:
+This is the USB core callback for OUT transfers (works for BULK).
+
+Remove HID OutEvent(...) usage:
+HID assumes fixed reports; BULK uses variable-length packets.
+
+Use USBD_LL_GetRxDataSize():
+Required to know actual received packet length.
+
+Always call USBD_LL_PrepareReceive() again:
+OUT endpoint must be re-armed after every packet.
 */
 
 static uint8_t USBD_CUSTOM_HID_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
@@ -227,6 +282,21 @@ static uint8_t USBD_CUSTOM_HID_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
   return USBD_OK;
 }
 //**************************************************************
+/*
+BULK IN transfer completion
+
+Function:
+USBD_CUSTOM_HID_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
+
+Keep function:
+HAL uses it to signal IN transfer completion.
+
+Keep state = CUSTOM_HID_IDLE:
+This releases the endpoint for the next transmission.
+
+Interpretation change:
+HID “idle” state now simply means TX not busy.
+*/
 //6) The Tx callback (IN). It is in the same file:
 static uint8_t USBD_CustomHID_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum) {
     // Transmission completed
